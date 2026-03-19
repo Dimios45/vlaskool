@@ -1,0 +1,82 @@
+# ManiSkill "Put Object On Plate" task configuration
+# Follows paper: "Simple Recipe Works: VLAs are Natural Continual Learners with RL"
+# Table 4 + Appendix H — ManiSkill benchmark, Scene 25 Main
+
+benchmark: maniskill
+base_model: smolvla  # paper uses OpenVLA; we adapt to SmolVLA (flow-matching, same as Pi-0)
+
+# Simulation parameters (Appendix D, Table 4)
+episode_length: 80          # H — steps per episode
+n_train_episodes: 10240     # episodes per task for GRPO
+n_eval_episodes: 100        # episodes for evaluation (per task)
+n_sft_demos: 35             # demos per training task (140 total / 4 tasks)
+
+# Object discretization (from paper)
+n_discrete_positions: 40    # × 4 rotations = 160 configurations
+n_discrete_rotations: 4
+
+# Training tasks (4 seen tasks)
+training_tasks:
+  - id: "put_carrot_on_plate"
+    instruction: "put carrot on plate"
+    object_name: "carrot"
+    object_id: "YCB_carrot"
+
+  - id: "put_bread_on_plate"
+    instruction: "put bread on plate"
+    object_name: "bread"
+    object_id: "YCB_bread_loaf"
+
+  - id: "put_ketchup_on_plate"
+    instruction: "put ketchup bottle on plate"
+    object_name: "ketchup_bottle"
+    object_id: "YCB_ketchup_bottle"
+
+  - id: "put_cup_on_plate"
+    instruction: "put fast food cup on plate"
+    object_name: "fast_food_cup"
+    object_id: "YCB_cup"
+
+# Held-out tasks (4 unseen tasks — evaluated only after all training)
+held_out_tasks:
+  - id: "put_watering_can_on_plate"
+    instruction: "put watering can on plate"
+    object_name: "watering_can"
+    object_id: "YCB_watering_can"
+
+  - id: "put_pipe_on_plate"
+    instruction: "put pipe on plate"
+    object_name: "pipe"
+    object_id: "YCB_pipe"
+
+  - id: "put_toy_bear_on_plate"
+    instruction: "put toy bear on plate"
+    object_name: "toy_bear"
+    object_id: "YCB_toy_bear"
+
+  - id: "put_hamburger_on_plate"
+    instruction: "put hamburger on plate"
+    object_name: "hamburger"
+    object_id: "YCB_hamburger"
+
+# Scene standardization (paper: standardized plate/background/table colors)
+scene:
+  plate_color: [0.8, 0.8, 0.8]       # light gray
+  table_color: [0.6, 0.5, 0.4]       # wood brown
+  background_color: [0.9, 0.9, 0.9]  # off-white
+  plate_radius: 0.12                  # meters
+  table_height: 0.0                   # z offset
+
+# Camera setup
+cameras:
+  - name: "overhead"
+    width: 224
+    height: 224
+    fov: 60
+    position: [0.0, 0.0, 1.2]
+    look_at: [0.0, 0.0, 0.0]
+  - name: "wrist"
+    width: 224
+    height: 224
+    fov: 80
+    # mounted on robot wrist — dynamic

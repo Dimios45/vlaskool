@@ -1,0 +1,122 @@
+# Training hyperparameters
+# Source: Appendix F, Table 6 — "Simple Recipe Works" (arXiv 2603.11653)
+# All parameters from paper unless noted with [ours]
+
+# ─────────────────────────────────────────────
+# GRPO (Group Relative Policy Optimization)
+# ─────────────────────────────────────────────
+grpo:
+  algorithm: "GRPO"
+  optimizer: "AdamW"
+  learning_rate: 2.0e-5        # exact from paper
+  betas: [0.9, 0.999]          # AdamW β₁, β₂
+  eps: 1.0e-5                  # AdamW ε
+  weight_decay: 0.0
+  grad_clip_norm: 1.0          # max gradient norm
+
+  # Batch / rollout
+  global_batch_size: 8192      # total transitions per update (paper Table 6)
+  rollout_epochs: 16           # optimization passes per collected batch
+  group_size: 8                # G — parallel rollouts per initial state
+
+  # PPO-style clipping
+  clip_ratio_low: 0.20         # ε_low
+  clip_ratio_high: 0.28        # ε_high
+
+  # RL coefficients
+  discount_gamma: 0.99
+  gae_lambda: 0.95
+  kl_coef: 0.0                 # β — no KL penalty
+  entropy_bonus: 0.0
+
+  # Exploration (Gaussian wrapper for flow-matching actions)
+  # For SmolVLA (flow-matching), we add Gaussian noise for stochastic policy
+  # Follows paper's Flow-SDE: dx = v_θ dt + σ dW
+  exploration_sigma: 0.1       # [ours] noise std for action exploration
+  sigma_decay: 0.995           # [ours] per-update sigma decay
+  sigma_min: 0.01              # [ours] minimum exploration noise
+
+# ─────────────────────────────────────────────
+# SFT (Supervised / Behavior Cloning)
+# ─────────────────────────────────────────────
+sft:
+  optimizer: "AdamW"
+  learning_rate: 1.0e-4        # standard BC LR
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  batch_size: 32
+  num_epochs: 100
+  warmup_steps: 100
+  scheduler: "cosine"
+
+# ─────────────────────────────────────────────
+# LoRA (Low-Rank Adaptation)
+# ─────────────────────────────────────────────
+lora:
+  r: 32                        # rank — exact from paper
+  lora_alpha: 32               # α = r (unit scaling)
+  lora_dropout: 0.0            # no dropout
+  bias: "none"
+  # Target modules in SmolVLM-500M backbone
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# ─────────────────────────────────────────────
+# SmolVLA model
+# ─────────────────────────────────────────────
+model:
+  pretrained_name: "lerobot/smolvla_base"  # HuggingFace hub
+  action_dim: 6                  # SmolVLA native: 6-DOF EE delta (no explicit gripper)
+  state_dim: 6                   # SmolVLA native: 6D TCP pose [x,y,z,qx,qy,qz]
+  image_size: 224                # pixels
+  n_action_steps: 1              # single-step actions (no chunking, like OpenVLA on ManiSkill)
+  use_bf16: true                 # bfloat16 for RTX 4090
+  use_flash_attn: true
+  grad_checkpointing: true
+  compile: false                 # set true after debugging
+
+# ─────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────
+env:
+  sim_backend: "gpu"            # ManiSkill3 GPU parallelism
+  num_envs: 8                   # = group_size
+  render_mode: "rgb_array"
+  obs_mode: "rgbd"              # RGB + depth
+
+# ─────────────────────────────────────────────
+# Continual Learning
+# ─────────────────────────────────────────────
+continual:
+  method: "seq_ft_lora"         # sequential fine-tuning with LoRA (paper's main recipe)
+  reset_lora_between_tasks: false  # keep LoRA weights across tasks (no reset)
+  reset_optimizer_between_tasks: true
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  n_episodes: 100               # episodes per task per evaluation
+  eval_after_each_task: true    # build full success matrix S[i,j]
+  seeds: [0, 1, 2]              # 3 seeds (paper reports mean ± SE)
+  deterministic: true           # no exploration noise during eval
+  video_save_freq: 10           # save video every N eval episodes
+
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+logging:
+  project: "vlaskool"
+  entity: null                  # set your wandb entity
+  log_interval: 10              # steps between log writes
+  save_checkpoint_freq: 500     # update steps between checkpoints
+  checkpoint_dir: "checkpoints"
+  results_dir: "results"

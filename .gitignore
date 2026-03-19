@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+
+# Results & checkpoints (large, generated)
+results/
+checkpoints/
+
+# Demo data (large .h5 files)
+data/
+
+# Claude session
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
