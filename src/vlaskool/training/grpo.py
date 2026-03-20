@@ -210,7 +210,7 @@ class GRPOTrainer:
             stats["update_steps"].append(self._update_step)
             stats["sigma"].append(self.sigma)
 
-            if update_idx % self.log_interval == 0:
+            if update_idx % min(self.log_interval, max(1, n_updates // 10)) == 0 or update_idx == n_updates - 1:
                 logger.info(
                     f"  [{task_id}] update {update_idx+1}/{n_updates} | "
                     f"success={sr:.3f} | loss={avg_loss:.4f} | σ={self.sigma:.4f}"
