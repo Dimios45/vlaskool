@@ -72,6 +72,7 @@ class GRPOTrainer:
         wandb_run=None,
         checkpoint_dir: Path = Path("checkpoints"),
         log_interval: int = 10,
+        grpo_mode: str = "reinforce",
     ) -> None:
         self.policy = policy
         self.env = env
@@ -95,6 +96,7 @@ class GRPOTrainer:
         self.wandb_run = wandb_run
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_interval = log_interval
+        self.grpo_mode = grpo_mode
 
         # Optimizer is created fresh per task (paper: reset between tasks)
         self.optimizer: Optional[AdamW] = None
@@ -145,7 +147,8 @@ class GRPOTrainer:
             f"  total_episodes:   {self.total_episodes}\n"
             f"  n_updates:        {n_updates}\n"
             f"  groups_per_update:{n_groups_per_update}\n"
-            f"  rollout_epochs:   {self.rollout_epochs}\n"
+            f"  rollout_epochs:   {self.rollout_epochs} (effective: {1 if self.grpo_mode == 'reinforce' else self.rollout_epochs})\n"
+            f"  grpo_mode:        {self.grpo_mode}\n"
             f"  exploration σ:    {self.sigma:.4f}\n"
             f"{'='*60}"
         )
@@ -168,6 +171,7 @@ class GRPOTrainer:
                 exploration_sigma=self.sigma,
                 device=self.device,
                 instruction=instruction,
+                skip_fm_log_prob=(self.grpo_mode == "reinforce"),
             )
             batch = batch.to(self.device)
 
@@ -181,11 +185,17 @@ class GRPOTrainer:
             # We process the full collected batch once per epoch.
             accum_steps = max(1, B // self.vla_minibatch_size)
 
-            for epoch in range(self.rollout_epochs):
+            # REINFORCE mode: no off-policy reuse (fresh noise each forward)
+            effective_rollout_epochs = 1 if self.grpo_mode == "reinforce" else self.rollout_epochs
+
+            for epoch in range(effective_rollout_epochs):
                 self.optimizer.zero_grad()
                 epoch_loss = 0.0
                 for mb in batch.minibatch_iter(self.vla_minibatch_size):
-                    loss, _pg = self._grpo_loss(mb)
+                    if self.grpo_mode == "reinforce":
+                        loss, _pg = self._grpo_loss_reinforce(mb)
+                    else:
+                        loss, _pg = self._grpo_loss(mb)
                     # Scale loss for gradient accumulation
                     (loss / accum_steps).backward()
                     epoch_loss += loss.item()
@@ -274,3 +284,30 @@ class GRPOTrainer:
         pg_loss = -torch.min(unclipped, clipped).mean()
 
         return pg_loss, pg_loss
+
+    def _grpo_loss_reinforce(self, batch: RolloutBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        """REINFORCE-style GRPO: advantage-weighted FM loss.
+
+        Uses the same gradient pathway as SFT (which demonstrably works):
+          L = mean(FM_loss_per_sample · advantage)
+
+        Positive advantage → minimize FM loss (reinforce success).
+        Negative advantage → maximize FM loss (push away from failure).
+        No importance ratio needed — fresh noise/time each forward.
+        """
+        obs = {
+            "observation.images.camera1": batch.obs_images,
+            "observation.state": batch.obs_states,
+            "task": batch.tasks,
+        }
+
+        # Per-sample FM loss (positive MSE, fresh noise/time, with gradients)
+        fm_loss = self.policy.compute_fm_loss_per_sample(
+            obs=obs, action=batch.mus,
+        )  # (B,)
+
+        adv = batch.advantages.to(fm_loss.device)
+
+        # Advantage-weighted FM loss
+        loss = (fm_loss * adv).mean()
+        return loss, loss

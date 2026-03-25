@@ -102,6 +102,7 @@ def collect_rollouts(
     exploration_sigma: float,
     device: torch.device,
     instruction: str,
+    skip_fm_log_prob: bool = False,
 ) -> RolloutBatch:
     """Collect n_groups × G episodes using the stochastic policy.
 
@@ -148,25 +149,27 @@ def collect_rollouts(
             noise_eps = torch.randn_like(action) * exploration_sigma
             action_noisy = action + noise_eps                      # (G, action_dim)
 
-            # Sample FM noise/time for importance ratio computation later
-            # Use the same distribution SmolVLA uses internally
-            fm_noise_sample = torch.randn(G, 1, max_action_dim, device=device)  # (G,1,D)
-            fm_time_sample = torch.rand(G, device=device)                        # (G,)
+            if skip_fm_log_prob:
+                # REINFORCE mode: no importance ratio needed, skip VLM forward
+                fm_noise_sample = torch.zeros(G, 1, max_action_dim, device=device)
+                fm_time_sample = torch.zeros(G, device=device)
+                lp = torch.zeros(G, device=device)
+            else:
+                # PPO mode: sample FM noise/time for importance ratio computation
+                fm_noise_sample = torch.randn(G, 1, max_action_dim, device=device)  # (G,1,D)
+                fm_time_sample = torch.rand(G, device=device)                        # (G,)
 
-            # Compute old FM log_prob using the sampled noise/time
-            # Temporarily build obs for fm log_prob computation
-            obs_for_lp = {
-                "observation.images.camera1": img,
-                "observation.state": state,
-                "task": obs["task"],
-            }
-            try:
-                lp = policy.compute_fm_log_prob(
-                    obs_for_lp, mu, fm_noise=fm_noise_sample, fm_time=fm_time_sample
-                )  # (G,)
-            except Exception:
-                # Fallback to Gaussian
-                lp = SmolVLALoRAPolicy._gaussian_log_prob(action_noisy, mu, exploration_sigma)
+                obs_for_lp = {
+                    "observation.images.camera1": img,
+                    "observation.state": state,
+                    "task": obs["task"],
+                }
+                try:
+                    lp = policy.compute_fm_log_prob(
+                        obs_for_lp, mu, fm_noise=fm_noise_sample, fm_time=fm_time_sample
+                    )  # (G,)
+                except Exception:
+                    lp = SmolVLALoRAPolicy._gaussian_log_prob(action_noisy, mu, exploration_sigma)
 
             g_images.append(img)
             g_states.append(state)

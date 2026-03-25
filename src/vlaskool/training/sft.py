@@ -47,6 +47,7 @@ class DemoDataset(Dataset):
         instruction: str,
         chunk_size: int = 50,
         action_dim: int = 6,
+        success_only: bool = False,
     ) -> None:
         self.instruction = instruction
         self.chunk_size = chunk_size
@@ -58,9 +59,13 @@ class DemoDataset(Dataset):
             logger.warning(f"Demo directory not found: {demo_path}")
             return
 
+        n_skipped = 0
         for ep_file in sorted(demo_path.glob("episode_*.h5")):
             try:
-                ep = self._load_episode(ep_file)
+                ep, is_success = self._load_episode(ep_file)
+                if success_only and not is_success:
+                    n_skipped += 1
+                    continue
                 if ep["actions"].shape[-1] != action_dim:
                     logger.warning(
                         f"Action dim mismatch in {ep_file}: "
@@ -72,16 +77,18 @@ class DemoDataset(Dataset):
                 logger.warning(f"Could not load {ep_file}: {e}")
 
         n_steps = sum(len(ep["actions"]) for ep in self.episodes)
+        filter_msg = f" (skipped {n_skipped} failures)" if n_skipped else ""
         logger.info(
-            f"DemoDataset: {len(self.episodes)} episodes, {n_steps} steps — {task_id!r}"
+            f"DemoDataset: {len(self.episodes)} episodes, {n_steps} steps — {task_id!r}{filter_msg}"
         )
 
-    def _load_episode(self, path: Path) -> dict:
+    def _load_episode(self, path: Path) -> tuple[dict, bool]:
         with h5py.File(path, "r") as f:
             images = f["observations/images/overhead"][:]  # (T, H, W, C)
             state = f["observations/state"][:]             # (T, state_dim)
             actions = f["actions"][:]                       # (T, action_dim)
-        return {"images": images, "state": state, "actions": actions}
+            success = bool(f.attrs.get("success", True))
+        return {"images": images, "state": state, "actions": actions}, success
 
     def __len__(self) -> int:
         return sum(len(ep["actions"]) for ep in self.episodes)
@@ -117,6 +124,51 @@ class DemoDataset(Dataset):
         raise IndexError(f"Index out of range: {idx}")
 
 
+class MultiTaskDemoDataset(Dataset):
+    """Combines demos from ALL tasks for joint multi-task SFT.
+
+    Prevents sequential forgetting by training on all tasks simultaneously.
+    """
+
+    def __init__(
+        self,
+        demo_dir: Path | str,
+        tasks: list[dict],
+        chunk_size: int = 50,
+        action_dim: int = 6,
+        success_only: bool = True,
+    ) -> None:
+        self.datasets: list[DemoDataset] = []
+        self.cumulative_lengths: list[int] = []
+        total = 0
+        for task_cfg in tasks:
+            ds = DemoDataset(
+                demo_dir=demo_dir,
+                task_id=task_cfg["id"],
+                instruction=task_cfg["instruction"],
+                chunk_size=chunk_size,
+                action_dim=action_dim,
+                success_only=success_only,
+            )
+            self.datasets.append(ds)
+            total += len(ds)
+            self.cumulative_lengths.append(total)
+
+        logger.info(
+            f"MultiTaskDemoDataset: {len(tasks)} tasks, {total} total steps"
+        )
+
+    def __len__(self) -> int:
+        return self.cumulative_lengths[-1] if self.cumulative_lengths else 0
+
+    def __getitem__(self, idx: int) -> dict:
+        for i, cum_len in enumerate(self.cumulative_lengths):
+            if idx < cum_len:
+                offset = self.cumulative_lengths[i - 1] if i > 0 else 0
+                return self.datasets[i][idx - offset]
+        raise IndexError(f"Index out of range: {idx}")
+
+
 class SFTTrainer:
     """Behavior cloning trainer using SmolVLA's native flow-matching loss.
 
@@ -144,9 +196,11 @@ class SFTTrainer:
         wandb_run=None,
         checkpoint_dir: Path = Path("checkpoints"),
         log_interval: int = 10,
+        success_only: bool = False,
     ) -> None:
         self.policy = policy
         self.demo_dir = Path(demo_dir)
+        self.success_only = success_only
         self.lr = learning_rate
         self.betas = betas
         self.adam_eps = adam_eps
@@ -187,6 +241,7 @@ class SFTTrainer:
             instruction=instruction,
             chunk_size=chunk_size,
             action_dim=self.policy.action_dim,
+            success_only=self.success_only,
         )
         if len(dataset) == 0:
             logger.warning(f"No demos found for {task_id!r} — skipping SFT")
@@ -293,5 +348,127 @@ class SFTTrainer:
         if save_path is not None:
             self.policy.save_lora(save_path)
             logger.info(f"SFT checkpoint saved → {save_path}")
+
+        return stats
+
+    def train_multitask(
+        self,
+        tasks: list[dict],
+        save_path: Optional[Path] = None,
+    ) -> dict[str, list]:
+        """Train via flow-matching BC on ALL tasks jointly.
+
+        Uses MultiTaskDemoDataset to shuffle across tasks in each epoch,
+        preventing the sequential forgetting that occurs with per-task SFT.
+        """
+        config = getattr(self.policy.base_policy, "config", None)
+        chunk_size = getattr(config, "chunk_size", 50)
+
+        dataset = MultiTaskDemoDataset(
+            demo_dir=self.demo_dir,
+            tasks=tasks,
+            chunk_size=chunk_size,
+            action_dim=self.policy.action_dim,
+            success_only=self.success_only,
+        )
+        if len(dataset) == 0:
+            logger.warning("No demos found for multi-task SFT — skipping")
+            return {"loss": [], "epoch": []}
+
+        accum_steps = max(1, self.batch_size // self.micro_batch_size)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.micro_batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        optimizer = AdamW(
+            self.policy.trainable_parameters(),
+            lr=self.lr,
+            betas=self.betas,
+            eps=self.adam_eps,
+            weight_decay=self.weight_decay,
+        )
+
+        def lr_lambda(step: int) -> float:
+            if step < self.warmup_steps:
+                return step / max(self.warmup_steps, 1)
+            return 1.0
+
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
+        self.policy.train()
+        stats = {"loss": [], "epoch": []}
+        global_step = 0
+        task_ids = [t["id"] for t in tasks]
+        label = "+".join(task_ids)
+
+        for epoch in range(self.num_epochs):
+            epoch_loss = 0.0
+            n_batches = 0
+            optimizer.zero_grad()
+
+            for mb_idx, batch in enumerate(loader):
+                fm_batch = {
+                    "observation.images.camera1": batch["observation.images.camera1"].to(
+                        self.device, dtype=self.policy.dtype
+                    ),
+                    "observation.state": batch["observation.state"].to(
+                        self.device, dtype=self.policy.dtype
+                    ),
+                    "action": batch["action"].to(
+                        self.device, dtype=self.policy.dtype
+                    ),
+                    "task": batch["task"],
+                }
+
+                with torch.autocast("cuda", dtype=self.policy.dtype):
+                    loss, loss_dict = self.policy.base_policy.forward(fm_batch)
+
+                (loss / accum_steps).backward()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+                if (mb_idx + 1) % accum_steps == 0:
+                    nn.utils.clip_grad_norm_(
+                        self.policy.trainable_parameters(), self.grad_clip
+                    )
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+            if n_batches % accum_steps != 0:
+                nn.utils.clip_grad_norm_(
+                    self.policy.trainable_parameters(), self.grad_clip
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+            avg_loss = epoch_loss / max(n_batches, 1)
+            stats["loss"].append(avg_loss)
+            stats["epoch"].append(epoch)
+
+            if epoch % self.log_interval == 0:
+                logger.info(
+                    f"  [multitask] SFT epoch {epoch+1}/{self.num_epochs} | loss={avg_loss:.6f}"
+                )
+
+            if self.wandb_run is not None:
+                self.wandb_run.log({
+                    "sft/multitask/loss": avg_loss,
+                    "sft/multitask/epoch": epoch,
+                    "sft_step": global_step,
+                })
+
+        if save_path is not None:
+            self.policy.save_lora(save_path)
+            logger.info(f"Multi-task SFT checkpoint saved → {save_path}")
 
         return stats

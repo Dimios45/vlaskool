@@ -48,6 +48,12 @@ def main():
     parser.add_argument("--sft-epochs", type=int, default=100)
     parser.add_argument("--sft-batch-size", type=int, default=32)
     parser.add_argument("--sft-lr", type=float, default=1e-4)
+    parser.add_argument("--sft-success-only", action="store_true", default=True,
+                        help="Filter SFT demos to successes only (default: True)")
+    parser.add_argument("--sft-all-demos", action="store_true",
+                        help="Include failures in SFT (overrides --sft-success-only)")
+    parser.add_argument("--sft-multitask", action="store_true",
+                        help="Joint multi-task SFT instead of sequential")
     # GRPO phase (paper values)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch-size", type=int, default=8192)
@@ -56,6 +62,9 @@ def main():
     parser.add_argument("--episodes", type=int, default=10240)
     parser.add_argument("--episode-length", type=int, default=80)
     parser.add_argument("--sigma", type=float, default=0.1)
+    parser.add_argument("--grpo-mode", type=str, default="reinforce",
+                        choices=["ppo", "reinforce"],
+                        help="GRPO loss mode: 'reinforce' (advantage-weighted FM) or 'ppo' (importance ratio)")
     # LoRA
     parser.add_argument("--lora-rank", type=int, default=32)
     # Eval
@@ -68,6 +77,9 @@ def main():
     parser.add_argument("--skip-sft", action="store_true", help="Skip SFT, use --lora-checkpoint instead")
     parser.add_argument("--lora-checkpoint", type=str, default=None, help="Pre-trained LoRA checkpoint to start GRPO from")
     args = parser.parse_args()
+
+    # Resolve SFT demo filtering
+    sft_success_only = args.sft_success_only and not args.sft_all_demos
 
     wandb_run = None
     if args.wandb:
@@ -102,6 +114,8 @@ def main():
             sft_batch_size=args.sft_batch_size,
             sft_num_epochs=args.sft_epochs,
             sft_demo_dir=args.sft_demo_dir,
+            sft_success_only=sft_success_only,
+            sft_multitask=args.sft_multitask,
             n_eval_episodes=args.n_eval,
             episode_length=args.episode_length,
             device=args.device,
@@ -116,12 +130,17 @@ def main():
         logger.info(f"SFT metrics: {sft_metrics}")
 
         # Find the last SFT checkpoint (after training all 4 tasks)
-        last_task = TRAINING_TASKS[-1]
-        last_idx = len(TRAINING_TASKS) - 1
-        sft_checkpoint = str(
-            output_dir / "sft" / f"seed_{args.seed}" / "checkpoints"
-            / f"task_{last_idx:02d}_{last_task['id']}"
-        )
+        if args.sft_multitask:
+            sft_checkpoint = str(
+                output_dir / "sft" / f"seed_{args.seed}" / "checkpoints" / "sft_multitask"
+            )
+        else:
+            last_task = TRAINING_TASKS[-1]
+            last_idx = len(TRAINING_TASKS) - 1
+            sft_checkpoint = str(
+                output_dir / "sft" / f"seed_{args.seed}" / "checkpoints"
+                / f"task_{last_idx:02d}_{last_task['id']}"
+            )
         logger.info(f"SFT checkpoint: {sft_checkpoint}")
 
         sft_elapsed = (time.time() - t0) / 60
@@ -147,6 +166,7 @@ def main():
         total_episodes=args.episodes,
         episode_length=args.episode_length,
         exploration_sigma=args.sigma,
+        grpo_mode=args.grpo_mode,
         n_eval_episodes=args.n_eval,
         device=args.device,
         sim_backend=args.sim_backend,

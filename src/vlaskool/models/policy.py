@@ -178,6 +178,53 @@ class SmolVLALoRAPolicy(nn.Module):
         fm_loss = per_sample.float().mean(dim=(1, 2))  # (B,)
         return -fm_loss  # log p ≈ -MSE (larger = more likely)
 
+    def compute_fm_loss_per_sample(
+        self,
+        obs: dict,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample FM loss (positive MSE) with gradients for REINFORCE-style GRPO.
+
+        Unlike compute_fm_log_prob, this:
+        - Returns positive MSE (not negated)
+        - Samples fresh noise/time each call (like SFT does)
+        - Maintains full gradient graph for backprop
+
+        Returns: (B,) per-sample mean MSE loss
+        """
+        obs = self._to_device(obs)
+        action = action.to(self.device).float()
+        B = action.shape[0]
+
+        config = getattr(self.base_policy, "config", None)
+        chunk_size = getattr(config, "chunk_size", 50)
+
+        if action.ndim == 2:
+            action_3d = action.unsqueeze(1).expand(-1, chunk_size, -1).contiguous()
+        else:
+            action_3d = action
+            if action_3d.shape[1] != chunk_size:
+                action_3d = action_3d[:, :chunk_size, :]
+                if action_3d.shape[1] < chunk_size:
+                    repeat_times = (chunk_size + action_3d.shape[1] - 1) // action_3d.shape[1]
+                    action_3d = action_3d.repeat(1, repeat_times, 1)[:, :chunk_size, :]
+
+        batch = {_ACTION_KEY: action_3d.to(self.device)}
+        batch.update(obs)
+
+        # Let SmolVLA sample fresh noise/time (same as SFT training)
+        with self._autocast():
+            loss_scalar, loss_dict = self.base_policy.forward(
+                batch, noise=None, time=None
+            )
+
+        if "losses_after_rm_padding" in loss_dict:
+            per_sample = loss_dict["losses_after_rm_padding"]  # (B, T, D)
+        else:
+            per_sample = loss_scalar.expand(B, 1, self.action_dim)
+
+        return per_sample.float().mean(dim=(1, 2))  # (B,) positive MSE
+
     def compute_log_prob(
         self,
         obs: dict,

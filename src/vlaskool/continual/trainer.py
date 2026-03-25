@@ -77,6 +77,10 @@ class ContinualRLTrainer:
         sft_batch_size: int = 32,
         sft_num_epochs: int = 100,
         sft_demo_dir: str = "data/demos",
+        sft_success_only: bool = False,
+        sft_multitask: bool = False,
+        # GRPO mode
+        grpo_mode: str = "reinforce",
         # Evaluation
         n_eval_episodes: int = 100,
         eval_after_each_task: bool = True,
@@ -110,6 +114,9 @@ class ContinualRLTrainer:
         self.sft_batch_size = sft_batch_size
         self.sft_epochs = sft_num_epochs
         self.sft_demo_dir = Path(sft_demo_dir)
+        self.sft_success_only = sft_success_only
+        self.sft_multitask = sft_multitask
+        self.grpo_mode = grpo_mode
         self.n_eval_episodes = n_eval_episodes
         self.eval_after_each_task = eval_after_each_task
         self.device = torch.device(device)
@@ -183,54 +190,67 @@ class ContinualRLTrainer:
             return metrics
 
         # ── Sequential training ───────────────────────────────────────────────
-        # For continual_rl: create ONE GPU env and reuse it across tasks via switch_task().
-        # This avoids the SAPIEN GPU render system lifecycle bug (fails on 2nd+ create).
-        grpo_env_wrapper: Optional[VecEnvWrapper] = None
-        if self.mode == "continual_rl":
-            first_task = self.training_tasks[0]
-            grpo_env_wrapper = VecEnvWrapper(
-                make_maniskill_env(
-                    object_name=first_task["object_name"],
-                    instruction=first_task["instruction"],
-                    num_envs=self.group_size,
-                    sim_backend=self.sim_backend,
-                    robot_uids=self.robot_uids,
-                )
-            )
 
-        try:
-          for task_idx, task_cfg in enumerate(self.training_tasks):
-            task_id = task_cfg["id"]
-            instruction = task_cfg["instruction"]
+        # Multi-task SFT: train all tasks jointly, then evaluate once
+        if self.mode == "sft" and self.sft_multitask:
             logger.info(f"\n{'─'*60}")
-            logger.info(f"Training task {task_idx+1}/{len(self.training_tasks)}: {task_id!r}")
-
-            ckpt_path = self.output_dir / "checkpoints" / f"task_{task_idx:02d}_{task_id}"
-
-            if self.mode == "sft":
-                self._train_sft(policy, task_cfg, ckpt_path)
-
-            elif self.mode == "continual_rl":
-                # Switch the existing GPU env to the new task object
-                if task_idx > 0:
-                    grpo_env_wrapper.switch_task(task_cfg["object_name"], instruction)
-                self._train_grpo(policy, task_cfg, ckpt_path, env_wrapper=grpo_env_wrapper)
-
-            else:
-                raise ValueError(f"Unknown mode: {self.mode!r}")
-
-            # ── Evaluate all tasks after training this one ────────────────────
-            if self.eval_after_each_task:
-                evaluator.evaluate_all(
-                    after_task_idx=task_idx + 1,
-                    success_matrix=sm,
+            logger.info("Multi-task SFT: training all tasks jointly")
+            ckpt_path = self.output_dir / "checkpoints" / "sft_multitask"
+            self._train_sft_multitask(policy, ckpt_path)
+            # Evaluate once — fill the final row of the success matrix
+            T = len(self.training_tasks)
+            evaluator.evaluate_all(after_task_idx=T, success_matrix=sm)
+            sm.save(self.output_dir / "success_matrix_partial.json")
+            sm.print()
+        else:
+            # For continual_rl: create ONE GPU env and reuse it across tasks via switch_task().
+            # This avoids the SAPIEN GPU render system lifecycle bug (fails on 2nd+ create).
+            grpo_env_wrapper: Optional[VecEnvWrapper] = None
+            if self.mode == "continual_rl":
+                first_task = self.training_tasks[0]
+                grpo_env_wrapper = VecEnvWrapper(
+                    make_maniskill_env(
+                        object_name=first_task["object_name"],
+                        instruction=first_task["instruction"],
+                        num_envs=self.group_size,
+                        sim_backend=self.sim_backend,
+                        robot_uids=self.robot_uids,
+                    )
                 )
-                sm.save(self.output_dir / "success_matrix_partial.json")
-                sm.print()
 
-        finally:
-            if grpo_env_wrapper is not None:
-                grpo_env_wrapper.close()
+            try:
+              for task_idx, task_cfg in enumerate(self.training_tasks):
+                task_id = task_cfg["id"]
+                instruction = task_cfg["instruction"]
+                logger.info(f"\n{'─'*60}")
+                logger.info(f"Training task {task_idx+1}/{len(self.training_tasks)}: {task_id!r}")
+
+                ckpt_path = self.output_dir / "checkpoints" / f"task_{task_idx:02d}_{task_id}"
+
+                if self.mode == "sft":
+                    self._train_sft(policy, task_cfg, ckpt_path)
+
+                elif self.mode == "continual_rl":
+                    # Switch the existing GPU env to the new task object
+                    if task_idx > 0:
+                        grpo_env_wrapper.switch_task(task_cfg["object_name"], instruction)
+                    self._train_grpo(policy, task_cfg, ckpt_path, env_wrapper=grpo_env_wrapper)
+
+                else:
+                    raise ValueError(f"Unknown mode: {self.mode!r}")
+
+                # ── Evaluate all tasks after training this one ────────────────
+                if self.eval_after_each_task:
+                    evaluator.evaluate_all(
+                        after_task_idx=task_idx + 1,
+                        success_matrix=sm,
+                    )
+                    sm.save(self.output_dir / "success_matrix_partial.json")
+                    sm.print()
+
+            finally:
+                if grpo_env_wrapper is not None:
+                    grpo_env_wrapper.close()
 
         # ── Final held-out evaluation ─────────────────────────────────────────
         logger.info("\nFinal: evaluating held-out tasks")
@@ -288,6 +308,7 @@ class ContinualRLTrainer:
             device=str(self.device),
             wandb_run=self.wandb_run,
             checkpoint_dir=self.output_dir / "checkpoints",
+            grpo_mode=self.grpo_mode,
         )
 
         try:
@@ -312,10 +333,30 @@ class ContinualRLTrainer:
             num_epochs=self.sft_epochs,
             device=str(self.device),
             wandb_run=self.wandb_run,
+            success_only=self.sft_success_only,
         )
         trainer.train(
             task_id=task_cfg["id"],
             instruction=task_cfg["instruction"],
+            save_path=ckpt_path,
+        )
+
+    def _train_sft_multitask(
+        self, policy: SmolVLALoRAPolicy, ckpt_path: Path
+    ) -> None:
+        """Run behavior cloning on ALL tasks jointly (multi-task SFT mode)."""
+        trainer = SFTTrainer(
+            policy=policy,
+            demo_dir=self.sft_demo_dir,
+            learning_rate=self.sft_lr,
+            batch_size=self.sft_batch_size,
+            num_epochs=self.sft_epochs,
+            device=str(self.device),
+            wandb_run=self.wandb_run,
+            success_only=self.sft_success_only,
+        )
+        trainer.train_multitask(
+            tasks=self.training_tasks,
             save_path=ckpt_path,
         )
 
